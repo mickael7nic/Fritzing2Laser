@@ -22,6 +22,8 @@ NUM_OPTS = [
     ("lines",  "Anzahl Linien um Kupferbahnen",          int,   "0 = Spalt vollständig füllen"),
     ("mark",   "Zentrierpunkt Bohrung Ø [mm]",           float, "0 = aus"),
     ("hole",   "Lochdurchmesser runde Löcher [mm]",      float, "0 = wie SVG (Button ◯)"),
+    ("iso",    "Isolationsbreite [mm]",                  float, "0 = alles Freie lasern"),
+    ("kerf",   "Schnittbreite [mm]",                     float, "für Bohren / Platinenkontur"),
     ("res",    "Rasterauflösung [px/mm]",                float, "100 = 0,01 mm"),
     ("eps",    "Vereinfachungstoleranz [mm]",            float, "größer = weniger Punkte"),
 ]
@@ -586,6 +588,8 @@ class App(tk.Tk):
         f.columnconfigure(1, weight=1)
         files = [("svg", "Kupfer-SVG (Fritzing Etch)", "file", [("SVG", "*.svg")]),
                  ("drill", "Bohrdatei (optional)", "file", [("Excellon", "*.txt *.drl *.xln"), ("Alle", "*.*")]),
+                 ("mask", "Lötstopp-SVG (optional)", "file", [("SVG", "*.svg")]),
+                 ("silk", "Bestückungsdruck-SVG (Oberseite)", "file", [("SVG", "*.svg")]),
                  ("font", "Schrift .ttf (optional)", "file", [("Schrift", "*.ttf *.otf")]),
                  ("outdir", "Ausgabeordner (leer = wie SVG)", "dir", None)]
         for r, (k, lbl, kind, ft) in enumerate(files):
@@ -595,9 +599,9 @@ class App(tk.Tk):
             ttk.Button(f, text="…", width=3,
                        command=lambda k=k, kind=kind, ft=ft: self.browse(k, kind, ft)
                        ).grid(row=r, column=2, **pad)
-        ttk.Label(f, text="Dateinamen-Präfix (leer = auto)").grid(row=4, column=0, sticky="w", **pad)
+        ttk.Label(f, text="Dateinamen-Präfix (leer = auto)").grid(row=len(files), column=0, sticky="w", **pad)
         self.v["prefix"] = tk.StringVar()
-        ttk.Entry(f, textvariable=self.v["prefix"]).grid(row=4, column=1, sticky="ew", **pad)
+        ttk.Entry(f, textvariable=self.v["prefix"]).grid(row=len(files), column=1, sticky="ew", **pad)
 
         # Einstellungen
         mid = ttk.Frame(main)
@@ -606,7 +610,13 @@ class App(tk.Tk):
 
         s = ttk.LabelFrame(mid, text="Einstellungen", padding=6)
         s.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
-        for r, (k, lbl, typ, hint) in enumerate(NUM_OPTS):
+        ttk.Label(s, text="Profil", font=("TkDefaultFont", 10, "bold")).grid(row=0, column=0, sticky="w", **pad)
+        self.v["profile"] = tk.StringVar()
+        cb = ttk.Combobox(s, textvariable=self.v["profile"], values=list(core.PROFILES),
+                          state="readonly", width=18)
+        cb.grid(row=0, column=1, columnspan=2, sticky="w", **pad)
+        cb.bind("<<ComboboxSelected>>", self.set_profile)
+        for r, (k, lbl, typ, hint) in enumerate(NUM_OPTS, start=1):
             ttk.Label(s, text=lbl).grid(row=r, column=0, sticky="w", **pad)
             self.v[k] = tk.StringVar()
             if k == "lines":
@@ -615,7 +625,7 @@ class App(tk.Tk):
                 w = ttk.Entry(s, width=10, textvariable=self.v[k])
             w.grid(row=r, column=1, sticky="w", **pad)
             ttk.Label(s, text=hint, foreground="gray").grid(row=r, column=2, sticky="w", **pad)
-        r = len(NUM_OPTS) + 1
+        r = len(NUM_OPTS) + 2
         ttk.Label(s, text="Drehung [°]").grid(row=r - 1, column=0, sticky="w", **pad)
         self.v["rotate"] = tk.StringVar()
         ttk.Combobox(s, textvariable=self.v["rotate"], values=["0", "90", "-90", "180"],
@@ -633,11 +643,16 @@ class App(tk.Tk):
         for r, (k, lbl) in enumerate([("vektor", "Vektor (nur Linie/Cut, 1 Gang)"),
                                        ("gang1", "Gang 1 Fläche (Fill)"),
                                        ("gang2", "Gang 2 Kontur (Linie)"),
+                                       ("bohren", "Bohren (Kreise, Linie)"),
+                                       ("kontur", "Platinenkontur ausschneiden"),
+                                       ("loetstopp", "Lötstopp freilegen (Masken-SVG)"),
+                                       ("mask_invert", "  Maske invertieren"),
+                                       ("bestueckung", "Bestückungsdruck (Oberseite)"),
                                        ("drop_text", "Texte im Kupfer weglassen")]):
             self.v[k] = tk.BooleanVar()
             ttk.Checkbutton(o, text=lbl, variable=self.v[k]).grid(row=r, column=0, sticky="w", **pad)
-        ttk.Button(o, text="Standardwerte", command=lambda: self.apply(core.DEFAULTS, files=False)
-                   ).grid(row=5, column=0, sticky="w", padx=6, pady=(12, 3))
+        ttk.Button(o, text="Standardwerte des Profils", command=self.set_profile
+                   ).grid(row=10, column=0, sticky="w", padx=6, pady=(12, 3))
 
         # Start
         b = ttk.Frame(main)
@@ -672,9 +687,15 @@ class App(tk.Tk):
         self.fill_tree()
 
     # ------------------------------------------------------------ Werte
+    def set_profile(self, *_):
+        """Profil-Werte (Abstände, Isolationsbreite …) in die Maske übernehmen."""
+        name = self.v["profile"].get() or "CO2 + Lack"
+        self.apply({**core.DEFAULTS, **core.PROFILES[name], "profile": name}, files=False)
+        self.write(f"Profil '{name}' geladen.\n")
+
     def apply(self, opts, files=True):
         for k, d in core.DEFAULTS.items():
-            if not files and k in ("svg", "drill", "outdir", "prefix", "font"):
+            if not files and k in ("svg", "drill", "mask", "silk", "outdir", "prefix", "font"):
                 continue
             val = opts.get(k, d)
             if k in self.v:
@@ -715,13 +736,26 @@ class App(tk.Tk):
                     self.v["drill"].set("")
                     self.write("Keine passende Bohrdatei neben der SVG gefunden – Feld geleert, "
                                "bitte Bohrdatei wählen.\n")
+                mcand = os.path.join(d, os.path.basename(p).replace("_copper_", "_mask_"))
+                if mcand != p and os.path.isfile(mcand):
+                    self.v["mask"].set(mcand)
+                    self.write(f"Lötstopp-SVG automatisch gesetzt: {mcand}\n")
+                else:
+                    self.v["mask"].set("")
+                scand = os.path.join(d, stem + "_etch_silk_top.svg")
+                if os.path.isfile(scand):
+                    self.v["silk"].set(scand)
+                    self.write(f"Bestückungsdruck-SVG automatisch gesetzt: {scand}\n")
+                else:
+                    self.v["silk"].set("")
 
     # ------------------------------------------------------------ Historie
     @staticmethod
     def summary(o):
-        parts = []
+        parts = ["Faser" if o.get("profile", "").startswith("Faser") else "CO2"]
+        if o.get("iso"): parts.append(f"Iso {o['iso']} mm")
         if o.get("vektor"):
-            parts.append(f"Vektor {'voll' if not o.get('lines') else str(o['lines']) + ' Linien'}"
+            parts.append(f"Vektor {'Streifen' if o.get('iso') else 'voll' if not o.get('lines') else str(o['lines']) + ' Linien'}"
                          f" / {o.get('step')} mm")
         if o.get("gang1"): parts.append("G1")
         if o.get("gang2"): parts.append("G2")
@@ -729,6 +763,10 @@ class App(tk.Tk):
         parts.append(f"Punkt {o.get('mark')} mm")
         if o.get("rotate"): parts.append(f"Drehung {int(o['rotate']):+d}°")
         if o.get("hole"): parts.append(f"Loch Ø {o['hole']} mm")
+        if o.get("bohren"): parts.append("Bohren")
+        if o.get("kontur"): parts.append("Kontur")
+        if o.get("loetstopp"): parts.append("Lötstopp")
+        if o.get("bestueckung"): parts.append("Bestückung")
         if o.get("drop_text"): parts.append("ohne Text")
         if o.get("mirror") != "auto": parts.append(f"Spiegeln {o.get('mirror')}")
         return ", ".join(parts)
@@ -775,6 +813,12 @@ class App(tk.Tk):
             messagebox.showerror("Eingabe", "Bitte eine Kupfer-SVG wählen."); return
         if o["drill"] and not os.path.isfile(o["drill"]):
             messagebox.showerror("Eingabe", "Bohrdatei nicht gefunden."); return
+        nm = os.path.basename(o["svg"]).lower()
+        if ("_silk" in nm or "_mask" in nm or "copper" not in nm) and not messagebox.askyesno(
+                "Kupfer-SVG prüfen",
+                f"Die Datei im Feld 'Kupfer-SVG' heißt\n\n{os.path.basename(o['svg'])}\n\n"
+                "und ist vermutlich keine Kupferlage (erwartet: …_etch_copper_…).\n\nTrotzdem verwenden?"):
+            return
         if o["drill"] and os.path.dirname(os.path.abspath(o["drill"])) != \
                 os.path.dirname(os.path.abspath(o["svg"])):
             if not messagebox.askyesno(

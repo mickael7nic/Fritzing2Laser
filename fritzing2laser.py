@@ -31,7 +31,7 @@ import cv2
 import ezdxf
 import resvg_py
 
-VERSION = "2026-11-24b"
+VERSION = "2026-11-28"
 
 UNIT_MM = {"in": 25.4, "mm": 1.0, "cm": 10.0, "pt": 25.4 / 72, "px": 25.4 / 90, "": 25.4 / 90}
 
@@ -56,8 +56,9 @@ def load_svg(path, drop_text=False):
         root.set("width", repr(w_mm)); root.set("height", repr(h_mm))
     for k in ("x", "y"):
         root.attrib.pop(k, None)
+    # gespiegelt = die ganze Lage (oberste Gruppe), nicht ein einzelnes gespiegeltes Bauteil
     mirrored = False
-    for g in root.iter():
+    for g in root:
         t = g.get("transform", "")
         if t.replace(" ", "").startswith("matrix(-1,"):
             mirrored = True
@@ -336,16 +337,74 @@ def round_holes_svg(o, log=print):
     return fn
 
 
+def circle_poly(cx, cy, r, n=72):
+    a = np.linspace(0, 2 * np.pi, n, endpoint=False)
+    return list(zip(np.round(cx + r * np.cos(a), 4), np.round(cy + r * np.sin(a), 4)))
+
+
+def board_outline(path, w_px, h_px, pxmm, h_mm, w_mm, eps):
+    """Platinenumriss aus dem Fritzing-Element id='boardoutline' (auch nicht rechteckig)."""
+    ET.register_namespace("", "http://www.w3.org/2000/svg")
+    root = ET.parse(path).getroot()
+    keep = None
+    for el in root.iter():
+        if el.get("id") == "boardoutline":
+            keep = el
+            break
+    if keep is None:                                    # Fallback: Rechteck = SVG-Größe
+        return [[(0.0, 0.0), (w_mm, 0.0), (w_mm, h_mm), (0.0, h_mm)]]
+    parents = {c: p for p in root.iter() for c in p}
+    chain = set()
+    el = keep
+    while el is not None:
+        chain.add(el)
+        el = parents.get(el)
+    for p in list(root.iter()):                         # alles außer dem Umriss entfernen
+        for c in list(p):
+            if c not in chain and not any(c is k for k in keep.iter()):
+                p.remove(c)
+    keep.set("fill", "black"); keep.set("fill-opacity", "1"); keep.set("stroke", "black")
+    vb = root.get("viewBox")
+    if vb:
+        _, _, vw, vh = map(float, vb.replace(",", " ").split())
+        root.set("width", repr(vw)); root.set("height", repr(vh))
+    for k in ("x", "y"):
+        root.attrib.pop(k, None)
+    im = render(ET.tostring(root, encoding="unicode"), w_px, h_px, [])
+    m = cv2.copyMakeBorder((im < 128).astype(np.uint8), 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
+    cs, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    out = []
+    for c in cs:
+        c = cv2.approxPolyDP(c, eps * pxmm, True).reshape(-1, 2).astype(float)
+        if len(c) >= 3:
+            out.append(list(zip(np.round((c[:, 0] - 0.5) / pxmm, 4),
+                                np.round(h_mm - (c[:, 1] - 0.5) / pxmm, 4))))
+    return out
+
+
 # ---------------------------------------------------------------- Verarbeitung
-DEFAULTS = dict(svg="", drill="", outdir="", prefix="", rotate=0, res=100.0, offset=0.05, mark=0.5, hole=0.0,
-                step=0.06, lines=0, eps=0.012, mirror="auto", font="", drop_text=False,
-                gang1=True, gang2=True, vektor=True)
+DEFAULTS = dict(svg="", drill="", mask="", silk="", outdir="", prefix="", profile="CO2 + Lack", rotate=0,
+                res=100.0, offset=0.05, mark=0.5, hole=0.0, step=0.06, lines=0, iso=0.0, kerf=0.1,
+                eps=0.012, mirror="auto", font="", drop_text=False, mask_invert=False,
+                gang1=True, gang2=True, vektor=True, bohren=False, kontur=False, loetstopp=False,
+                bestueckung=False)
+
+# Voreinstellungen je Laser. Faserlaser (xTool F1 Ultra): Spot 0,03 mm, Kupfer wird direkt
+# abgetragen -> feinere Abstände, nur ein Isolationsstreifen um die Leiterbahnen.
+PROFILES = {
+    "CO2 + Lack":        dict(offset=0.05, step=0.06, eps=0.012, mark=0.5, iso=0.0, kerf=0.1),
+    "Faserlaser direkt": dict(offset=0.015, step=0.025, eps=0.005, mark=0.4, iso=0.3, kerf=0.03),
+}
 
 
 def process(o, log=print):
     """o: dict mit Schlüsseln wie DEFAULTS. Gibt Liste der erzeugten Dateien zurück."""
     o = {**DEFAULTS, **o}
     log(f"fritzing2laser Version {VERSION}  ({os.path.abspath(__file__)})")
+    log(f"Profil: {o['profile']}")
+    nm = os.path.basename(o["svg"]).lower()
+    if "_silk" in nm or "_mask" in nm or "copper" not in nm:
+        log("WARNUNG: Die Kupfer-SVG heißt nicht '…_etch_copper_…' – ist das wirklich die Kupferlage?")
     svg_str, w_mm, h_mm, svg_mir = load_svg(o["svg"], o["drop_text"])
     pxmm = float(o["res"])
     w_px, h_px = int(round(w_mm * pxmm)), int(round(h_mm * pxmm))
@@ -364,6 +423,44 @@ def process(o, log=print):
     im = render(svg_str, w_px, h_px, fonts)
     laser = (im > 128).astype(np.uint8)          # weiß = kein Kupfer = Lack weg
 
+    if o["drop_text"]:
+        # Fritzing spart um Kupfertexte die Massefläche aus. Ohne Text bliebe diese Aussparung
+        # als Text-Umriss stehen -> Aussparungen, die nur den Text umgeben, mit Kupfer füllen.
+        full, _, _, _ = load_svg(o["svg"], False)
+        txt = ((render(full, w_px, h_px, fonts) < 128) & (laser > 0)).astype(np.uint8)
+        if txt.any():
+            # Massefläche = größte Kupferfläche; alles übrige Kupfer (Bahnen, Pads) behält seinen Abstand
+            n_c, lab_c, st_c, _ = cv2.connectedComponentsWithStats((laser == 0).astype(np.uint8), connectivity=8)
+            filled = 0
+            if n_c > 1:
+                gnd_id = 1 + int(np.argmax(st_c[1:, cv2.CC_STAT_AREA]))
+                gnd = (lab_c == gnd_id).astype(np.uint8)
+                other = ((laser == 0) & (gnd == 0)).astype(np.uint8)
+                dt_txt = cv2.distanceTransform((1 - txt).astype(np.uint8), cv2.DIST_L2, 5)
+                dt_oth = cv2.distanceTransform((1 - other).astype(np.uint8), cv2.DIST_L2, 5)
+                # Freistellabstand der Massefläche um den Text: Abstand Text -> Massefläche-Kante
+                edge = (laser > 0) & (cv2.dilate(gnd, np.ones((3, 3), np.uint8)) > 0) & (dt_txt < 2.0 * pxmm)
+                if edge.any():
+                    c = float(np.median(dt_txt[edge]))
+                    fill = (laser > 0) & (dt_txt <= c + 1.5) & (dt_oth > c)
+                    filled = int(fill.sum())
+                    laser[fill] = 0
+                    # winzige, frei stehende Reste in der Nähe der Texte ebenfalls schließen
+                    nr, lr, sr, _ = cv2.connectedComponentsWithStats(laser, connectivity=8)
+                    nearby = dt_txt <= c + 0.3 * pxmm
+                    for li in range(1, nr):
+                        if sr[li, cv2.CC_STAT_AREA] < 0.02 * pxmm * pxmm:
+                            sl = (slice(sr[li, 1], sr[li, 1] + sr[li, 3]),
+                                  slice(sr[li, 0], sr[li, 0] + sr[li, 2]))
+                            comp = lr[sl] == li
+                            if nearby[sl][comp].all():
+                                laser[sl][comp] = 0
+                    log(f"Texte weggelassen: Aussparung um die Texte (Abstand {c / pxmm:.2f} mm) "
+                        f"mit Kupfer gefüllt, Abstände zu Bahnen/Pads bleiben")
+            if not filled:
+                log("Texte weggelassen (keine Massefläche-Aussparung gefunden)")
+
+    hole_res = []
     if o["drill"]:
         holes = load_drill(o["drill"])
         mir = svg_mir if o["mirror"] == "auto" else (o["mirror"] == "ja")
@@ -383,6 +480,7 @@ def process(o, log=print):
         # Fritzing-Padlöcher (von Leiterbahn-Enden angeschnitten) durch runde Zentrierpunkte
         # ersetzen. Mitte = Lochmitte aus der SVG (konzentrisch zum Pad).
         res, lab, st, n_fit = analyze_holes(orig, holes, lambda x, y: to_px(x, y, mir), pxmm)
+        hole_res = res
         rr = int(round(float(o["mark"]) / 2 * pxmm))
         for h in res:                 # erst alle Fritzing-Löcher (inkl. Teilstücke) zu Kupfer …
             for li in h["li"] or []:
@@ -400,8 +498,48 @@ def process(o, log=print):
         log("WARNUNG: Keine Bohrdatei angegeben – Fritzing-Löcher bleiben unverändert "
             "(angeschnitten, keine runden Zentrierpunkte)!")
 
-    laser = cv2.copyMakeBorder(laser, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
     eps, off = float(o["eps"]), float(o["offset"])
+    iso = float(o["iso"])
+    if iso > 0:
+        # Freie Bereiche am Platinenrand, die nur an EINE Kupferfläche grenzen (z.B. der Rand
+        # zwischen Massefläche und Platinenkante), trennen nichts -> nicht isolieren, sonst
+        # entsteht ein überflüssiger Rahmen entlang der Kante.
+        nc, lab_cu, st_cu, _ = cv2.connectedComponentsWithStats((laser == 0).astype(np.uint8), connectivity=8)
+        gnd_id = -1                   # Massefläche: größte Kupferfläche, wenn > 15 % der Platine
+        if nc > 1:
+            big = 1 + int(np.argmax(st_cu[1:, cv2.CC_STAT_AREA]))
+            if st_cu[big, cv2.CC_STAT_AREA] > 0.15 * laser.size:
+                gnd_id = big
+        nw, lab_w, st_w, _ = cv2.connectedComponentsWithStats(laser, connectivity=8)
+        border = set(np.unique(np.concatenate([lab_w[0], lab_w[-1], lab_w[:, 0], lab_w[:, -1]])))
+        kept = 0
+        for li in border - {0}:
+            x0, y0 = max(0, st_w[li, 0] - 1), max(0, st_w[li, 1] - 1)
+            sl = (slice(y0, st_w[li, 1] + st_w[li, 3] + 1), slice(x0, st_w[li, 0] + st_w[li, 2] + 1))
+            comp = (lab_w[sl] == li).astype(np.uint8)
+            ring = cv2.dilate(comp, np.ones((3, 3), np.uint8)) & (comp == 0)
+            nets = set(np.unique(lab_cu[sl][ring > 0])) - {0}
+            if len(nets) <= 1:
+                laser[sl][comp > 0] = 0
+                kept += 1
+            elif gnd_id in nets:
+                # grenzt an die Massefläche UND an weitere Kupferteile (z.B. Befestigungsringe):
+                # nur um die anderen Teile isolieren, die Massefläche wächst bis dorthin
+                oth = ((lab_cu > 0) & (lab_cu != gnd_id)).astype(np.uint8)
+                d_oth = cv2.distanceTransform(1 - oth, cv2.DIST_L2, 5) / pxmm
+                fill = (lab_w == li) & (d_oth > iso + 1.0 / pxmm)
+                laser[fill] = 0
+                kept += 1
+        if kept:
+            log(f"Randbereich ohne Trennfunktion bleibt Kupfer ({kept} Fläche(n)) – kein Rahmen an der Kante")
+    # Abstand zum Kupfer. Mit Isolationsbreite zählt der Platinenrand NICHT als Kupfer
+    # (kein Streifen entlang der Kante); ohne wird wie bisher bis an den Rand gefüllt.
+    dsrc = cv2.copyMakeBorder(laser, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=1 if iso > 0 else 0)
+    dist = cv2.distanceTransform(dsrc, cv2.DIST_L2, cv2.DIST_MASK_PRECISE) / pxmm
+    laser = cv2.copyMakeBorder(laser, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
+    if iso > 0:                       # nur ein Isolationsstreifen um das Kupfer, Rest bleibt stehen
+        laser = (laser & (dist <= iso + 0.5 / pxmm)).astype(np.uint8)
+        log(f"Isolationsbreite {iso:g} mm: nur Streifen um die Leiterbahnen wird abgetragen")
     jobs = []
     if o["gang1"]:
         log("Gang 1 (Fläche) …")
@@ -415,24 +553,86 @@ def process(o, log=print):
         # konzentrische Linien um das Kupfer, von der Kupferkante nach außen;
         # lines = 0 -> Spalt vollständig füllen, sonst max. 'lines' Linien
         log("Vektor-Füllung …")
-        dist = cv2.distanceTransform(laser, cv2.DIST_L2, cv2.DIST_MASK_PRECISE) / pxmm
         p3, r, n, nmax = [], off, 0, int(o["lines"])
-        while (dist > r).any() and (nmax <= 0 or n < nmax):
-            p3 += contours((dist > r).astype(np.uint8), pxmm, h_px, w_mm, h_mm, eps)
+        rmax = iso - float(o["step"]) / 2 if iso > 0 else np.inf
+        while (dist > r).any() and (nmax <= 0 or n < nmax) and (r <= rmax or n == 0):
+            if iso > 0:               # Kupfer um r aufgeweitet -> geschlossene Ringe, ohne Rand
+                m = (dist <= r).astype(np.uint8)
+                m[[0, -1], :] = 0; m[:, [0, -1]] = 0
+            else:
+                m = (dist > r).astype(np.uint8)
+            p3 += contours(m, pxmm, h_px, w_mm, h_mm, eps)
             r += float(o["step"]); n += 1
-        log(f"  {n} Linien je Kupferkante (alle Spalten vollständig gefüllt: "
-            f"{'ja' if not (dist > r).any() else 'nein'})")
+        log(f"  {n} Linien je Kupferkante" + (f" (Streifen {iso:g} mm)" if iso > 0 else
+            f" (alle Spalten vollständig gefüllt: {'ja' if not (dist > r).any() else 'nein'})"))
         jobs.append((p3, "Vektor", "VEKTOR", 5, False))
+
+    kerf = float(o["kerf"])
+    if o["bohren"]:
+        if not hole_res:
+            log("WARNUNG: Bohren gewählt, aber keine Bohrdatei – keine Bohrkonturen.")
+        else:
+            # Schnittlinie um halbe Schnittbreite nach innen, damit das Loch Nennmaß hat
+            pb = [circle_poly((h["hx"] + 0.5) / pxmm, h_mm - (h["hy"] + 0.5) / pxmm,
+                              max(h["d"] / 2 - kerf / 2, kerf)) for h in hole_res]
+            jobs.append((pb, "Bohren", "BOHREN", 3, False))
+            log(f"Bohren: {len(pb)} Kreise (Ø Bohrdatei − Schnittbreite {kerf:g} mm)")
+    if o["kontur"]:
+        po = board_outline(o["svg"], w_px, h_px, pxmm, h_mm, w_mm, eps)
+        jobs.append((po, "Platinenkontur", "KONTUR_PLATINE", 6, False))
+        log(f"Platinenkontur: {len(po)} Umriss(e)")
+    if o["loetstopp"]:
+        if not o["mask"] or not os.path.isfile(o["mask"]):
+            log("WARNUNG: Lötstopp gewählt, aber keine Masken-SVG – übersprungen.")
+        else:
+            ms, mw, mh, mmir = load_svg(o["mask"])
+            if abs(mw - w_mm) > 0.05 or abs(mh - h_mm) > 0.05:
+                log(f"WARNUNG: Masken-SVG hat andere Größe ({mw:.2f} x {mh:.2f} mm)!")
+            if mmir != svg_mir:
+                log("WARNUNG: Masken-SVG und Kupfer-SVG sind unterschiedlich gespiegelt!")
+            mk = (render(ms, w_px, h_px, fonts) < 128).astype(np.uint8)   # schwarz = Öffnung
+            if o["mask_invert"]:
+                mk = 1 - mk
+            if mk.mean() > 0.5:
+                log("WARNUNG: Über die Hälfte der Platine wäre freigelegt – "
+                    "Polarität prüfen ('Maske invertieren').")
+            mk = cv2.copyMakeBorder(mk, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
+            pm = contours(mk, pxmm, h_px, w_mm, h_mm, eps)
+            jobs.append((pm, "Loetstopp", "LOETSTOPP", 4, True))
+            log(f"Lötstopp-Freistellung: {len(pm)} Öffnungen")
+
+    jobs_top = []                     # Oberseite (nach dem Wenden der Platine)
+    if o["bestueckung"]:
+        if not o["silk"] or not os.path.isfile(o["silk"]):
+            log("WARNUNG: Bestückungsdruck gewählt, aber keine Silk-SVG – übersprungen.")
+        else:
+            ss, sw_, sh_, smir = load_svg(o["silk"], False)
+            if abs(sw_ - w_mm) > 0.05 or abs(sh_ - h_mm) > 0.05:
+                log(f"WARNUNG: Silk-SVG hat andere Größe ({sw_:.2f} x {sh_:.2f} mm)!")
+            if smir:
+                log("WARNUNG: Silk-SVG ist gespiegelt – für die Oberseite die NICHT gespiegelte "
+                    "'_etch_silk_top.svg' verwenden!")
+            sk = (render(ss, w_px, h_px, fonts) < 128).astype(np.uint8)   # schwarz = Druck
+            sk = cv2.copyMakeBorder(sk, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
+            ps = contours(sk, pxmm, h_px, w_mm, h_mm, eps)
+            jobs_top.append((ps, "Bestueckung", "BESTUECKUNG", 2, True))
+            jobs_top.append((board_outline(o["silk"], w_px, h_px, pxmm, h_mm, w_mm, eps),
+                             "Bestueckung_Umriss", "UMRISS_OBEN", 6, False))
+            log(f"Bestückungsdruck Oberseite: {len(ps)} Flächen (+ Umriss zum Ausrichten)")
 
     # Drehung (gegen den Uhrzeigersinn positiv), Nullpunkt bleibt unten links
     rot = int(o["rotate"]) % 360
+    def rp(p, r):
+        if r == 90:  return [(round(h_mm - y, 4), x) for x, y in p]
+        if r == 270: return [(y, round(w_mm - x, 4)) for x, y in p]
+        if r == 180: return [(round(w_mm - x, 4), round(h_mm - y, 4)) for x, y in p]
+        return p
     if rot:
-        def rp(p):
-            if rot == 90:  return [(round(h_mm - y, 4), x) for x, y in p]
-            if rot == 270: return [(y, round(w_mm - x, 4)) for x, y in p]
-            return [(round(w_mm - x, 4), round(h_mm - y, 4)) for x, y in p]
-        jobs = [([rp(p) for p in polys], *rest) for polys, *rest in jobs]
+        jobs = [([rp(p, rot) for p in polys], *rest) for polys, *rest in jobs]
         log(f"Gedreht um {int(o['rotate']):+d}°")
+    # Oberseite: Platine wird links<->rechts gewendet -> Drehsinn kehrt sich um
+    rot_top = (-rot) % 360
+    jobs += [([rp(p, rot_top) for p in polys], *rest) for polys, *rest in jobs_top]
     ow, oh = (h_mm, w_mm) if rot in (90, 270) else (w_mm, h_mm)
 
     prefix = o["prefix"] or re.sub(r"_etch.*$", "", os.path.splitext(os.path.basename(o["svg"]))[0])
@@ -451,21 +651,35 @@ def process(o, log=print):
 
 # ---------------------------------------------------------------- Kommandozeile
 def main():
-    ap = argparse.ArgumentParser(description="Fritzing-Kupfer-SVG -> DXF/SVG für Lack-Laserung")
+    ap = argparse.ArgumentParser(description="Fritzing-Kupfer-SVG -> DXF/SVG für Laser (CO2+Lack oder Faser direkt)")
     ap.add_argument("svg", help="Fritzing Etch-Export, z.B. *_etch_copper_bottom_mirror.svg")
     ap.add_argument("drill", nargs="?", default="", help="Fritzing *_drill.txt (Excellon), optional")
     ap.add_argument("-d", "--outdir", default="", help="Ausgabeordner (Std.: Ordner der SVG)")
     ap.add_argument("-o", "--prefix", default="", help="Dateinamen-Präfix (Std.: Name der SVG ohne _etch...)")
-    ap.add_argument("--res", type=float, default=100, help="Rasterauflösung px/mm (Std. 100 = 0,01 mm)")
-    ap.add_argument("--offset", type=float, default=0.05,
-                    help="Abstand der 1. Linie zur Kupferkante in mm (≈ halber Spot, Std. 0.05)")
-    ap.add_argument("--mark", type=float, default=0.5,
-                    help="Durchmesser Zentrierpunkt je Bohrung in mm (0 = aus, Std. 0.5)")
-    ap.add_argument("--step", type=float, default=0.06,
-                    help="Linienabstand der Vektor-Füllung in mm (Std. 0.06)")
-    ap.add_argument("--lines", type=int, default=0,
-                    help="Vektor: Anzahl Linien um die Kupferbahnen (0 = Spalt vollständig füllen)")
-    ap.add_argument("--eps", type=float, default=0.012, help="Vereinfachungstoleranz mm (Std. 0.012)")
+    ap.add_argument("--profile", choices=["co2", "faser"], default="co2",
+                    help="Voreinstellung: co2 = CO2-Laser + Lack, faser = Faserlaser trägt Kupfer direkt ab")
+    ap.add_argument("--res", type=float, default=None, help="Rasterauflösung px/mm (Std. 100 = 0,01 mm)")
+    ap.add_argument("--offset", type=float, default=None,
+                    help="Abstand der 1. Linie zur Kupferkante in mm (≈ halber Spot; co2 0.05, faser 0.015)")
+    ap.add_argument("--mark", type=float, default=None,
+                    help="Durchmesser Zentrierpunkt je Bohrung in mm (0 = aus; co2 0.5, faser 0.4)")
+    ap.add_argument("--step", type=float, default=None,
+                    help="Linienabstand der Vektor-Füllung in mm (co2 0.06, faser 0.025)")
+    ap.add_argument("--lines", type=int, default=None,
+                    help="Vektor: max. Anzahl Linien um die Kupferbahnen (0 = unbegrenzt)")
+    ap.add_argument("--iso", type=float, default=None,
+                    help="Isolationsbreite in mm: nur dieser Streifen um das Kupfer wird gelasert "
+                         "(0 = alles Freie; faser 0.3)")
+    ap.add_argument("--kerf", type=float, default=None,
+                    help="Schnittbreite für Bohren/Platinenkontur in mm (co2 0.1, faser 0.03)")
+    ap.add_argument("--bohren", action="store_true", help="Bohrkonturen ausgeben (*_Bohren)")
+    ap.add_argument("--kontur", action="store_true", help="Platinenumriss ausgeben (*_Platinenkontur)")
+    ap.add_argument("--silk", default="",
+                    help="Fritzing '_etch_silk_top.svg' -> *_Bestueckung (Druck auf der Oberseite)")
+    ap.add_argument("--mask", default="", help="Fritzing-Lötstopp-SVG -> *_Loetstopp (Pads freilegen)")
+    ap.add_argument("--mask-invert", dest="mask_invert", action="store_true",
+                    help="Lötstoppmaske invertiert auswerten")
+    ap.add_argument("--eps", type=float, default=None, help="Vereinfachungstoleranz mm (co2 0.012, faser 0.005)")
     ap.add_argument("--mirror", choices=["auto", "ja", "nein"], default="auto",
                     help="Bohrungen spiegeln (auto = wie SVG)")
     ap.add_argument("--font", default="", help="Schriftdatei .ttf, z.B. OCR-Fritzing-mono.ttf")
@@ -477,6 +691,10 @@ def main():
                     help="Lochdurchmesser für --round-holes in mm (0 = wie in der SVG)")
     ap.add_argument("--no-text", dest="drop_text", action="store_true", help="Texte im Kupfer weglassen")
     a = vars(ap.parse_args())
+    prof = "Faserlaser direkt" if a.pop("profile") == "faser" else "CO2 + Lack"
+    a = {**PROFILES[prof], **{k: v for k, v in a.items() if v is not None}, "profile": prof}
+    a["loetstopp"] = bool(a["mask"])
+    a["bestueckung"] = bool(a["silk"])
     if a.pop("round_holes"):
         round_holes_svg(a)
     else:

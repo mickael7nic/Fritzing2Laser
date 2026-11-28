@@ -1,24 +1,26 @@
 # fritzing2laser – Dokumentation
 
-Nov 24, 2026 · @Michi
+Nov 28, 2026 · @Michi
 
 ## Vorstellung
 
-**Platinen aus Fritzing direkt mit dem CO2-Laser herstellen, ohne Belichten und ohne Tonertransfer.**
+**Platinen aus Fritzing direkt mit dem Laser herstellen: mit dem CO2-Laser über Ätzlack oder mit dem Faserlaser direkt ins Kupfer.**
 
-fritzing2laser ist ein kleines Python-Programm mit grafischer Oberfläche. Es nimmt den Kupferexport und die Bohrdatei aus Fritzing und macht daraus fertige Laserdaten für lackierte Platinen: Der Laser entfernt den Ätzlack überall dort, wo kein Kupfer bleiben soll, danach wird ganz normal geätzt.
+fritzing2laser ist ein kleines Python-Programm mit grafischer Oberfläche. Es nimmt den Kupferexport und die Bohrdatei aus Fritzing und macht daraus fertige Laserdaten. Mit dem CO2-Laser entfernt man damit Ätzlack und ätzt danach; mit einem Faserlaser wie dem xTool F1 Ultra trägt man das Kupfer direkt ab, bohrt, schneidet die Platine aus und lasert den Bestückungsdruck.
 
 Entstanden ist es aus einem praktischen Problem: Die Fritzing-SVGs lassen sich nicht einfach in die Laser-Software laden. Die Lage muss richtig gespiegelt sein, Leiterbahn-Enden ragen in die Bohrlöcher, und eine reine Flächengravur legt Spalten quer zur Scanrichtung schlecht frei. Das Programm löst das automatisch.
 
 **Was es kann**
 
-- **Vektor-Modus:** füllt die Isolationsspalten mit parallelen Linien entlang der Leiterbahnen, gleich gut in jeder Richtung. Wahlweise nur wenige Linien um jede Bahn, wie beim Isolationsfräsen.
-- **Klassisch in zwei Gängen:** Flächengravur plus scharfe Kontur, für saubere Kanten.
-- **Saubere Bohrlöcher:** erkennt jedes Padloch, entfernt die hineinragenden Leiterbahn-Enden und setzt einen runden, mittigen Zentrierpunkt, der mitgeätzt wird. Das erleichtert das Bohren von Hand.
-- **Spiegelprüfung:** gleicht die Bohrdatei mit den Pads ab und warnt, wenn die Ausrichtung nicht stimmt.
-- **Maßhaltig:** rechnet mit 0,01 mm Auflösung, Abstand zur Kupferkante passend zum Laserspot einstellbar.
-- **Praktisch:** Drehung in 90°-Schritten, Texte optional weglassen, Historie der letzten 10 Projekte mit allen Einstellungen.
-- **Offen für jede Laser-Software:** Ausgabe als SVG und DXF in mm, erprobt mit M-Design Hub (Monport) und geeignet für LightBurn.
+- **Zwei Profile:** „CO2 + Lack“ und „Faserlaser direkt“ mit passenden Abständen für den jeweiligen Spot.
+- **Vektor-Modus:** füllt die Isolationsspalten mit parallelen Linien entlang der Leiterbahnen, gleich gut in jeder Richtung.
+- **Isolationsbreite:** beim Faserlaser nur ein Streifen fester Breite um die Leiterbahnen; das übrige Kupfer bleibt stehen, das spart viel Laserzeit.
+- **Saubere Bohrlöcher:** erkennt jedes Padloch, entfernt hineinragende Leiterbahn-Enden und setzt einen runden, mittigen Zentrierpunkt.
+- **Bohren und Ausschneiden:** Bohrkreise mit Nennmaß und Platinenumriss als eigene Dateien.
+- **Lötstopp und Bestückungsdruck:** Pads im Lötstopplack freilegen und den Bestückungsdruck auf der Oberseite lasern, deckungsgleich nach dem Wenden.
+- **Prüfungen:** Spiegelung der Bohrdatei, falsche Eingabedatei, Bohrdatei einer anderen Platine.
+- **Praktisch:** Drehung in 90°-Schritten, Texte weglassen (inklusive ihrer Aussparung in der Massefläche), Historie der letzten 10 Projekte.
+- **Offen für jede Laser-Software:** SVG und DXF in mm, erprobt mit M-Design Hub, geeignet für LightBurn und xTool Studio.
 
 Das Programm läuft unter Linux, braucht Python und vier frei verfügbare Bibliotheken und lässt sich auch ohne Oberfläche auf der Kommandozeile nutzen.
 
@@ -30,11 +32,10 @@ Die Ausgaben sind normale SVG- und DXF-Dateien in mm. Sie funktionieren in M-Des
 
 Arbeitsablauf:
 
-1. In Fritzing die Kupfer-SVG und die Bohrdatei exportieren.
-2. Beide Dateien in fritzing2laser laden und die Laserdaten erzeugen (SVG und DXF).
-3. Die Platine entfetten und dünn mit Acryllack beschichten, dann trocknen lassen.
-4. In M-Design Hub die Datei laden und den Lack weglasern.
-5. Ätzen, Lack mit Aceton entfernen, an den Zentrierpunkten bohren.
+1. In Fritzing die Kupfer-SVG und die Bohrdatei exportieren, für den Faserlaser bei Bedarf auch Lötstopp- und Bestückungsdruck-SVG.
+2. Dateien in fritzing2laser laden, Profil wählen und die Laserdaten erzeugen (SVG und DXF).
+3. **CO2 + Lack:** Platine entfetten und dünn mit Acryllack beschichten, Lack weglasern, ätzen, Lack mit Aceton entfernen, an den Zentrierpunkten bohren.
+4. **Faserlaser direkt:** Kupfer abtragen, bohren und Platinenkontur schneiden, Platine wenden und den Bestückungsdruck lasern.
 
 Das Programm besteht aus diesen Dateien, alle im selben Ordner:
 
@@ -45,7 +46,7 @@ Das Programm besteht aus diesen Dateien, alle im selben Ordner:
 | `fritzing2laser.desktop` | Starter für Anwendungsmenü und Dock (Linux) |
 | `OCR-Fritzing-mono.ttf` | optional: Originalschrift für Kupfertexte |
 
-Die Versionsangabe steht in der ersten Protokollzeile, aktuell `2026-11-24b`.
+Die Versionsangabe steht in der ersten Protokollzeile, aktuell `2026-11-28`.
 
 ## Einrichtung (Linux)
 
@@ -105,12 +106,14 @@ Gebraucht werden zwei Dateien aus demselben Export-Ordner: die Kupfer-SVG der La
 
 | Datei | Fritzing-Menü | Hinweis |
 | --- | --- | --- |
-| `<Name>_etch_copper_bottom_mirror.svg` | Datei → Exportieren → für die Produktion → Ätzbar (SVG) | für einseitige Platinen mit Bauteilen oben: gespiegelt ist richtig, wenn direkt auf die Kupferseite gelasert wird |
+| `<Name>_etch_copper_bottom_mirror.svg` | Datei → Exportieren → für die Produktion → Ätzbar (SVG) | Kupferlage; gespiegelt ist richtig, wenn direkt auf die Kupferseite gelasert wird |
 | `<Name>_drill.txt` | Datei → Exportieren → für die Produktion → Extended Gerber | aus dem Gerber-Export nur diese Datei verwenden |
+| `<Name>_etch_mask_bottom_mirror.svg` | wie die Kupfer-SVG (Ätzbar) | optional: Lötstoppmaske, gleich gespiegelt wie das Kupfer |
+| `<Name>_etch_silk_top.svg` | wie die Kupfer-SVG (Ätzbar) | optional: Bestückungsdruck Oberseite, **nicht** gespiegelt |
 
 Die Bohrdatei liegt immer in der Draufsicht vor. Ob sie gespiegelt werden muss, erkennt das Programm an der SVG und prüft es zusätzlich an den Pads. Die Menünamen können je nach Fritzing-Version leicht abweichen.
 
-Beide Dateien sollten im selben Ordner liegen: Die GUI trägt dann beim Wählen der SVG die passende Bohrdatei automatisch ein.
+Alle Dateien sollten im selben Ordner liegen: Die GUI trägt dann beim Wählen der Kupfer-SVG Bohrdatei, Lötstopp- und Bestückungsdruck-SVG automatisch ein. Darauf achten, im Feld „Kupfer-SVG“ wirklich die `_etch_copper_`-Datei zu wählen; bei einem anderen Namen fragt die GUI nach.
 
 ## Bedienung der Oberfläche
 
